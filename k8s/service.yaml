@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: content-scanner
+  namespace: sandbox-namespace
+  labels:
+    app: content-scanner
+spec:
+  type: ClusterIP
+  selector:
+    app: content-scanner
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
