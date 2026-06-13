@@ -14,15 +14,33 @@ An HTTP service that scans tool result content for prompt injection patterns. Wo
 - Returns **401** for missing or invalid Bearer tokens on `/scan`
 - Flags common prompt injection patterns (instruction override, jailbreak, fake system prompts, etc.)
 
+## Dev vs prod
+
+The same codebase supports two deployment modes. The service and Kubernetes manifests are identical; only the **GCP project** that backs the API key differs.
+
+| | **Dev mode** | **Prod mode** |
+|---|-------------|---------------|
+| **Purpose** | Local end-to-end testing on your own GCP account | Company production deployment |
+| **GCP project** | Your personal project (e.g. `pavo-scanner-dev-*`) | `agentplatform-prod` |
+| **Secret source** | GCP Secret Manager → Terraform → K8s secret | Same flow |
+| **Terraform config** | `terraform/dev.tfvars` | Default variables in `main.tf` (no `dev.tfvars`) |
+| **Setup script** | `./terraform/setup-gcp-dev.sh` | Requires company IAM access |
+| **Test script** | `./terraform/test-terraform.sh` (auto-reads `dev.tfvars`) | `./terraform/test-terraform.sh` (without `dev.tfvars`) |
+| **Billing** | Your own GCP billing account | Company billing |
+
+> **Important:** `http://content-scanner:8000/scan` is a **private in-cluster URL** in both modes. It resolves only inside Kubernetes (within `sandbox-namespace` for the short hostname). There is **no public domain or Ingress** — you cannot curl this hostname from your laptop.
+
 ## Architecture
 
 ```mermaid
 flowchart TB
-    subgraph GCP["GCP (agentplatform-prod)"]
-        SM["Secret Manager<br/>content-scanner-api-key"]
+    subgraph GCP["GCP Secret Manager"]
+        DevSM["Dev: your-project<br/>content-scanner-api-key"]
+        ProdSM["Prod: agentplatform-prod<br/>content-scanner-api-key"]
     end
 
     subgraph TF["Terraform"]
+        DevVars["dev.tfvars<br/>(dev mode only)"]
         TFApply["terraform apply"]
     end
 
@@ -33,8 +51,10 @@ flowchart TB
         Worker["Worker pods<br/>(e.g. exec-runner)"]
     end
 
-    SM -->|"read secret (no hardcode)"| TFApply
-    TFApply -->|"creates/updates"| K8sSecret
+    DevSM -.->|"dev mode"| DevVars
+    ProdSM -.->|"prod mode"| TFApply
+    DevVars --> TFApply
+    TFApply -->|"read secret (never hardcoded)"| K8sSecret
     K8sSecret -->|"SCAN_API_KEY env var"| Deploy
     Deploy --> SVC
     Worker -->|"POST /scan<br/>http://content-scanner:8000/scan"| SVC
@@ -46,7 +66,15 @@ flowchart TB
 Worker pod  →  ClusterIP content-scanner:8000  →  Content Scanner pod  →  PromptInjectionScanner
 ```
 
-> **Important:** `http://content-scanner:8000/scan` is a **private in-cluster URL**. It resolves only inside Kubernetes (within `sandbox-namespace` for the short hostname). There is **no public domain or Ingress** — you cannot curl this hostname from your laptop.
+**Secret flow (Terraform):**
+
+```
+GCP Secret Manager (content-scanner-api-key)
+        ↓  terraform apply
+Kubernetes Secret (sandbox-namespace/content-scanner-api-key)
+        ↓  env var injection
+content-scanner pod (SCAN_API_KEY)
+```
 
 ## Project structure
 
@@ -59,9 +87,12 @@ Worker pod  →  ClusterIP content-scanner:8000  →  Content Scanner pod  →  
 │   └── service.yaml              # ClusterIP Service on port 8000
 ├── terraform/
 │   ├── main.tf                   # GCP Secret Manager → K8s Secret
-│   ├── providers.tf
-│   ├── outputs.tf
-│   └── test-terraform.sh         # End-to-end Terraform test script
+│   ├── providers.tf              # Google + Kubernetes providers
+│   ├── outputs.tf                # Secret name/namespace outputs
+│   ├── dev.tfvars.example        # Template for dev mode
+│   ├── dev.tfvars                # Your dev project ID (gitignored, created by setup script)
+│   ├── setup-gcp-dev.sh          # Bootstrap dev GCP project + secret
+│   └── test-terraform.sh         # End-to-end Terraform test (dev or prod)
 └── pom.xml
 ```
 
@@ -71,16 +102,71 @@ Worker pod  →  ClusterIP content-scanner:8000  →  Content Scanner pod  →  
 |------|---------|
 | Java 21+ | Local development |
 | Maven 3.9+ | Build and test |
-| Docker Desktop | Container builds and local K8s (optional) |
+| Docker Desktop | Container builds and local K8s |
 | kubectl | Kubernetes deployment |
 | Terraform 1.5+ | Provision K8s secret from GCP |
-| gcloud CLI | GCP authentication and Secret Manager access |
+| gcloud CLI | GCP authentication and Secret Manager |
 
 Enable Kubernetes in **Docker Desktop → Settings → Kubernetes** for local cluster testing.
 
 ---
 
+## Quick start
+
+### Dev mode (full local stack)
+
+```bash
+# 1. Build and test the service
+mvn test
+docker build -t content-scanner:latest .
+
+# 2. Authenticate with GCP
+gcloud auth login
+gcloud auth application-default login
+
+# 3. Bootstrap your dev GCP project (creates project, secret, dev.tfvars)
+./terraform/setup-gcp-dev.sh
+
+# 4. Deploy to Kubernetes
+kubectl create namespace sandbox-namespace --dry-run=client -o yaml | kubectl apply -f -
+./terraform/test-terraform.sh
+kubectl apply -f k8s/
+kubectl rollout restart deployment/content-scanner -n sandbox-namespace
+
+# 5. Test in-cluster (the real worker URL)
+API_KEY=$(kubectl get secret content-scanner-api-key -n sandbox-namespace \
+  -o jsonpath='{.data.SCAN_API_KEY}' | base64 -d)
+
+kubectl run curl-test --rm -i --restart=Never -n sandbox-namespace \
+  --image=curlimages/curl:latest \
+  -- curl -s -X POST http://content-scanner:8000/scan \
+  -H "Authorization: Bearer ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"hello world"}'
+```
+
+### Prod mode
+
+Requires IAM access to `agentplatform-prod`. Remove or rename `terraform/dev.tfvars` so Terraform uses production defaults.
+
+```bash
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project agentplatform-prod
+gcloud auth application-default set-quota-project agentplatform-prod
+
+gcloud secrets describe content-scanner-api-key --project agentplatform-prod
+
+kubectl create namespace sandbox-namespace --dry-run=client -o yaml | kubectl apply -f -
+./terraform/test-terraform.sh
+kubectl apply -f k8s/
+```
+
+---
+
 ## 1. Run locally (Maven)
+
+No GCP or Kubernetes required. Set the API key yourself:
 
 ```bash
 export SCAN_API_KEY=your-secret-key
@@ -90,23 +176,19 @@ mvn spring-boot:run
 ### Test (localhost)
 
 ```bash
-# Health — no auth
 curl http://localhost:8000/health
 
-# Scan — valid auth
 curl -X POST http://localhost:8000/scan \
   -H "Authorization: Bearer your-secret-key" \
   -H "Content-Type: application/json" \
   -d '{"content":"hello world"}'
 
-# Scan — invalid auth (expect 401)
 curl -s -o /dev/null -w "HTTP %{http_code}\n" \
   -X POST http://localhost:8000/scan \
   -H "Authorization: Bearer wrong-key" \
   -H "Content-Type: application/json" \
   -d '{"content":"hello"}'
 
-# Scan — injection detected
 curl -X POST http://localhost:8000/scan \
   -H "Authorization: Bearer your-secret-key" \
   -H "Content-Type: application/json" \
@@ -123,22 +205,18 @@ mvn test
 
 ## 2. Docker
 
-### Build
+### Build and run
 
 ```bash
 docker build -t content-scanner:latest .
-```
 
-### Run
-
-```bash
 docker run -d --name content-scanner \
   -e SCAN_API_KEY=your-secret-key \
   -p 8000:8000 \
   content-scanner:latest
 ```
 
-### Test (host machine → container via localhost)
+### Test (localhost → container)
 
 ```bash
 curl http://localhost:8000/health
@@ -149,50 +227,58 @@ curl -X POST http://localhost:8000/scan \
   -d '{"content":"hello world"}'
 ```
 
-### Stop and remove
+### Stop
 
 ```bash
 docker stop content-scanner && docker rm content-scanner
 ```
 
-> Port 8000 must be free. If something else is using it (another container, Maven, or `kubectl port-forward`), stop it first or map a different port: `-p 8001:8000`.
+> Port 8000 must be free. Use `-p 8001:8000` if something else is bound to 8000.
 
 ---
 
 ## 3. Kubernetes
 
-The service is deployed in **`sandbox-namespace`** as a **ClusterIP** service named **`content-scanner`** on port **8000**.
+Deployed in **`sandbox-namespace`** as a **ClusterIP** service named **`content-scanner`** on port **8000**.
 
-### One-time setup
+### Deploy
 
 ```bash
-# Create namespace
 kubectl create namespace sandbox-namespace
 
-# Local dev only — create secret manually (skip if using Terraform)
+# Option A: Terraform-managed secret (recommended — see section 4)
+./terraform/test-terraform.sh
+
+# Option B: Manual secret (skip Terraform, dev only)
 kubectl create secret generic content-scanner-api-key \
   --namespace sandbox-namespace \
-  --from-literal=SCAN_API_KEY=your-secret-key
+  --from-literal=SCAN_API_KEY=your-local-dev-key
 
-# Deploy
 kubectl apply -f k8s/
-
-# Wait for rollout
 kubectl rollout status deployment/content-scanner -n sandbox-namespace
 ```
 
-### Verify deployment
+After Terraform updates the secret, restart pods so they pick up the new key:
 
 ```bash
-kubectl get pods,svc -n sandbox-namespace
-kubectl logs -n sandbox-namespace -l app=content-scanner
+kubectl rollout restart deployment/content-scanner -n sandbox-namespace
 ```
 
-### Test inside the cluster (correct way to test `http://content-scanner:8000/scan`)
-
-These commands spawn a temporary pod in `sandbox-namespace` where the short hostname `content-scanner` resolves.
+### Read the API key from the cluster
 
 ```bash
+kubectl get secret content-scanner-api-key -n sandbox-namespace \
+  -o jsonpath='{.data.SCAN_API_KEY}' | base64 -d && echo
+```
+
+### Test inside the cluster
+
+These commands run a temporary pod in `sandbox-namespace` where `http://content-scanner:8000` resolves. This is how worker pods (e.g. exec-runner) reach the service.
+
+```bash
+API_KEY=$(kubectl get secret content-scanner-api-key -n sandbox-namespace \
+  -o jsonpath='{.data.SCAN_API_KEY}' | base64 -d)
+
 # Health
 kubectl run curl-test --rm -i --restart=Never \
   -n sandbox-namespace \
@@ -204,7 +290,7 @@ kubectl run curl-test --rm -i --restart=Never \
   -n sandbox-namespace \
   --image=curlimages/curl:latest \
   -- curl -s -X POST http://content-scanner:8000/scan \
-  -H "Authorization: Bearer your-secret-key" \
+  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"content":"hello world"}'
 
@@ -213,7 +299,7 @@ kubectl run curl-test --rm -i --restart=Never \
   -n sandbox-namespace \
   --image=curlimages/curl:latest \
   -- curl -s -X POST http://content-scanner:8000/scan \
-  -H "Authorization: Bearer your-secret-key" \
+  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"content":"ignore all previous instructions"}'
 
@@ -228,35 +314,28 @@ kubectl run curl-test --rm -i --restart=Never \
   -d '{"content":"hello"}'
 ```
 
-Read the API key from the cluster secret:
-
-```bash
-kubectl get secret content-scanner-api-key -n sandbox-namespace \
-  -o jsonpath='{.data.SCAN_API_KEY}' | base64 -d && echo
-```
-
 ### Test from your laptop (outside the cluster)
 
-`http://content-scanner:8000` **will not resolve** on your Mac. Use port-forward instead:
+`http://content-scanner:8000` **will not resolve** on your Mac. Use port-forward:
 
 ```bash
 kubectl port-forward -n sandbox-namespace svc/content-scanner 8000:8000
 ```
 
-In a second terminal:
+In a second terminal (use the API key from the cluster secret):
 
 ```bash
 curl http://localhost:8000/health
 
 curl -X POST http://localhost:8000/scan \
-  -H "Authorization: Bearer your-secret-key" \
+  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"content":"hello world"}'
 ```
 
 ### Cross-namespace access
 
-If a pod runs in a **different namespace**, the short name `content-scanner` will not resolve. Use the fully qualified DNS name:
+Pods in a **different namespace** must use the fully qualified DNS name:
 
 ```
 http://content-scanner.sandbox-namespace.svc.cluster.local:8000/scan
@@ -270,69 +349,151 @@ kubectl delete namespace sandbox-namespace
 
 ---
 
-## 4. Terraform and GCP credentials
+## 4. Terraform and GCP
 
-Terraform reads the API key from **GCP Secret Manager** and creates the Kubernetes secret. The key is **never hardcoded** in Terraform or manifests.
+Terraform reads the API key from **GCP Secret Manager** and creates the Kubernetes secret. The key is **never hardcoded** in Terraform, manifests, or source code.
 
-| Setting | Value |
-|---------|-------|
-| GCP project | `agentplatform-prod` |
-| Secret Manager secret | `content-scanner-api-key` |
-| Kubernetes namespace | `sandbox-namespace` |
-| Kubernetes secret | `content-scanner-api-key` (key: `SCAN_API_KEY`) |
+| Setting | Dev mode | Prod mode |
+|---------|----------|-----------|
+| GCP project | Your project (in `dev.tfvars`) | `agentplatform-prod` |
+| Secret Manager secret | `content-scanner-api-key` | `content-scanner-api-key` |
+| Kubernetes namespace | `sandbox-namespace` | `sandbox-namespace` |
+| Kubernetes secret | `content-scanner-api-key` | `content-scanner-api-key` |
+| Terraform var file | `terraform/dev.tfvars` | none (uses `main.tf` defaults) |
 
-### GCP authentication (required before `terraform plan/apply`)
+---
+
+### Dev mode — your own GCP project
+
+Use this to test the full GCP → Terraform → Kubernetes flow without company IAM access.
+
+**Step 1 — Authenticate**
 
 ```bash
 gcloud auth login
 gcloud auth application-default login
-gcloud config set project agentplatform-prod
 ```
 
-You need permission to read the `content-scanner-api-key` secret in that project.
+**Step 2 — Bootstrap dev project**
 
-Verify access:
+Creates a GCP project (or uses an existing one), enables Secret Manager, creates the secret, and writes `terraform/dev.tfvars`:
 
 ```bash
-gcloud secrets describe content-scanner-api-key --project agentplatform-prod
+# Create a new project (requires billing on your Google account)
+./terraform/setup-gcp-dev.sh
+
+# Or use an existing project with billing enabled
+./terraform/setup-gcp-dev.sh your-existing-project-id
 ```
 
-### Apply Terraform
+If billing is not yet linked, the script saves the project ID to `dev.tfvars` and prints instructions. Link billing at [console.cloud.google.com/billing](https://console.cloud.google.com/billing), then re-run:
 
 ```bash
-cd terraform
-terraform init
-terraform validate
-terraform plan
-terraform apply
+./terraform/setup-gcp-dev.sh pavo-scanner-dev-XXXXX
 ```
 
-Or run the automated test script:
+**Step 3 — Run Terraform end-to-end test**
 
 ```bash
 ./terraform/test-terraform.sh
 ```
 
-The script validates config, checks GCP credentials, applies Terraform, and confirms the K8s secret length matches GCP (without printing the key).
+This script:
+1. Runs `terraform init` and `validate`
+2. Reads `terraform/dev.tfvars` for your project ID
+3. Verifies the GCP secret exists
+4. Imports an existing K8s secret if needed
+5. Runs `terraform plan` and `apply`
+6. Confirms K8s secret byte length matches GCP (without printing the key)
 
-### What Terraform creates
-
-```
-GCP Secret Manager (content-scanner-api-key)
-        ↓  terraform apply
-Kubernetes Secret (sandbox-namespace/content-scanner-api-key)
-        ↓  env var injection
-content-scanner pod (SCAN_API_KEY)
-```
-
-### Local dev without GCP
-
-For local Kubernetes testing without Terraform, create the secret manually:
+**Step 4 — Restart the scanner pod**
 
 ```bash
-kubectl create secret generic content-scanner-api-key \
-  --namespace sandbox-namespace \
-  --from-literal=SCAN_API_KEY=your-local-dev-key
+kubectl rollout restart deployment/content-scanner -n sandbox-namespace
+```
+
+**Step 5 — Verify the GCP key works in-cluster**
+
+```bash
+API_KEY=$(kubectl get secret content-scanner-api-key -n sandbox-namespace \
+  -o jsonpath='{.data.SCAN_API_KEY}' | base64 -d)
+
+kubectl run curl-test --rm -i --restart=Never -n sandbox-namespace \
+  --image=curlimages/curl:latest \
+  -- curl -s -X POST http://content-scanner:8000/scan \
+  -H "Authorization: Bearer ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"hello world"}'
+```
+
+**Manual apply (alternative to test script):**
+
+```bash
+cd terraform
+terraform init
+terraform plan -var-file=dev.tfvars
+terraform apply -var-file=dev.tfvars
+```
+
+---
+
+### Prod mode — `agentplatform-prod`
+
+Used in the real deployment. Requires company IAM access to read Secret Manager in `agentplatform-prod`.
+
+**Step 1 — Authenticate and set project**
+
+```bash
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project agentplatform-prod
+gcloud auth application-default set-quota-project agentplatform-prod
+```
+
+**Step 2 — Verify secret access**
+
+```bash
+gcloud secrets describe content-scanner-api-key --project agentplatform-prod
+```
+
+If you get `PERMISSION_DENIED`, request `roles/secretmanager.secretAccessor` on the project from your admin.
+
+**Step 3 — Apply Terraform**
+
+Ensure `terraform/dev.tfvars` is absent or renamed so prod defaults are used:
+
+```bash
+mv terraform/dev.tfvars terraform/dev.tfvars.bak   # if present
+
+./terraform/test-terraform.sh
+```
+
+Or manually:
+
+```bash
+cd terraform
+terraform init
+terraform plan
+terraform apply
+```
+
+**Step 4 — Deploy and restart**
+
+```bash
+kubectl apply -f k8s/
+kubectl rollout restart deployment/content-scanner -n sandbox-namespace
+```
+
+---
+
+### Terraform outputs
+
+After a successful apply:
+
+```
+gcp_secret_id               = projects/<project>/secrets/content-scanner-api-key
+kubernetes_secret_name      = content-scanner-api-key
+kubernetes_secret_namespace = sandbox-namespace
 ```
 
 ---
@@ -341,10 +502,10 @@ kubectl create secret generic content-scanner-api-key \
 
 | Where you call from | URL | Works? |
 |---------------------|-----|--------|
-| Pod in `sandbox-namespace` | `http://content-scanner:8000/scan` | Yes — intended production path |
+| Pod in `sandbox-namespace` | `http://content-scanner:8000/scan` | Yes — intended worker path |
 | Pod in another namespace | `http://content-scanner.sandbox-namespace.svc.cluster.local:8000/scan` | Yes — FQDN required |
 | Your laptop (Mac/terminal) | `http://content-scanner:8000/scan` | **No** — not in cluster DNS |
-| Your laptop via port-forward | `http://localhost:8000/scan` | Yes — for local debugging only |
+| Your laptop via port-forward | `http://localhost:8000/scan` | Yes — debugging only |
 | Public internet | — | **No** — no Ingress or public domain |
 
 Worker pods in `sandbox-namespace` should call:
@@ -359,34 +520,47 @@ Content-Type: application/json
 
 ---
 
-## End-to-end local test checklist
+## End-to-end test checklist
+
+### Dev mode
 
 ```bash
-# 1. Tests
+# Service
 mvn test
-
-# 2. Docker
 docker build -t content-scanner:latest .
-docker run -d --name content-scanner -e SCAN_API_KEY=test-key -p 8000:8000 content-scanner:latest
-curl http://localhost:8000/health
-docker stop content-scanner && docker rm content-scanner
 
-# 3. Kubernetes
-kubectl create namespace sandbox-namespace
-kubectl create secret generic content-scanner-api-key \
-  --namespace sandbox-namespace --from-literal=SCAN_API_KEY=test-key
+# GCP + Terraform
+gcloud auth application-default login
+./terraform/setup-gcp-dev.sh
+./terraform/test-terraform.sh
+
+# Kubernetes
+kubectl create namespace sandbox-namespace --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f k8s/
-kubectl rollout status deployment/content-scanner -n sandbox-namespace
+kubectl rollout restart deployment/content-scanner -n sandbox-namespace
 
-# 4. In-cluster test (the real URL)
+# In-cluster (real URL)
+API_KEY=$(kubectl get secret content-scanner-api-key -n sandbox-namespace \
+  -o jsonpath='{.data.SCAN_API_KEY}' | base64 -d)
+
 kubectl run curl-test --rm -i --restart=Never -n sandbox-namespace \
   --image=curlimages/curl:latest \
   -- curl -s http://content-scanner:8000/health
 
-# 5. Terraform (requires GCP access)
-gcloud auth application-default login
-./terraform/test-terraform.sh
+kubectl run curl-test --rm -i --restart=Never -n sandbox-namespace \
+  --image=curlimages/curl:latest \
+  -- curl -s -X POST http://content-scanner:8000/scan \
+  -H "Authorization: Bearer ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"hello world"}'
 ```
+
+### Prod mode
+
+Same as dev, but:
+- Remove/rename `terraform/dev.tfvars`
+- Authenticate against `agentplatform-prod`
+- Verify `gcloud secrets describe content-scanner-api-key --project agentplatform-prod` succeeds before applying
 
 ---
 
@@ -399,5 +573,8 @@ gcloud auth application-default login
 | `kubectl ... connection refused` | No Kubernetes cluster | Enable K8s in Docker Desktop |
 | `content-scanner: no such host` on Mac | Calling in-cluster URL from laptop | Use `kubectl port-forward` or in-cluster curl pod |
 | `content-scanner: no such host` in pod | Wrong namespace | Use FQDN or deploy caller to `sandbox-namespace` |
-| Terraform GCP auth error | Missing ADC credentials | Run `gcloud auth application-default login` |
-| Pod `CreateContainerConfigError` | Missing K8s secret | Create secret or run Terraform apply |
+| `PERMISSION_DENIED` on `agentplatform-prod` | No company IAM access | Use dev mode with `./terraform/setup-gcp-dev.sh` |
+| Secret Manager billing error | Billing not enabled on project | Link billing at [console.cloud.google.com/billing](https://console.cloud.google.com/billing), re-run setup |
+| Pod `CreateContainerConfigError` | Missing K8s secret | Run `./terraform/test-terraform.sh` or create secret manually |
+| Scan returns 401 after Terraform apply | Pod still using old secret | `kubectl rollout restart deployment/content-scanner -n sandbox-namespace` |
+| `test-terraform.sh` uses wrong project | Stale `dev.tfvars` | Check `terraform/dev.tfvars` or set `GCP_PROJECT=your-project ./terraform/test-terraform.sh` |

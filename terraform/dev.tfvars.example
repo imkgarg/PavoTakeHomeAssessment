@@ -1,0 +1,4 @@
+# Copy to dev.tfvars and set your own GCP project ID for local Terraform testing.
+# Production uses agentplatform-prod (see main.tf defaults).
+
+gcp_project_id = "YOUR_GCP_PROJECT_ID"

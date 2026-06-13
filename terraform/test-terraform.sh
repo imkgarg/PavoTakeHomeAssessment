@@ -5,9 +5,24 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TF_DIR="$ROOT/terraform"
 NAMESPACE="sandbox-namespace"
 SECRET_NAME="content-scanner-api-key"
-GCP_PROJECT="agentplatform-prod"
 GCP_SECRET="content-scanner-api-key"
+VAR_FILE="${TF_VAR_FILE:-$TF_DIR/dev.tfvars}"
 
+# Override with env var or dev.tfvars; default remains agentplatform-prod for prod.
+GCP_PROJECT="${GCP_PROJECT:-agentplatform-prod}"
+if [[ -f "$VAR_FILE" ]]; then
+  PROJECT_FROM_VARS="$(grep -E '^gcp_project_id' "$VAR_FILE" | cut -d'"' -f2 || true)"
+  if [[ -n "$PROJECT_FROM_VARS" && "$PROJECT_FROM_VARS" != "YOUR_GCP_PROJECT_ID" ]]; then
+    GCP_PROJECT="$PROJECT_FROM_VARS"
+  fi
+fi
+
+TF_ARGS=()
+if [[ -f "$VAR_FILE" ]] && grep -q 'gcp_project_id' "$VAR_FILE"; then
+  TF_ARGS=(-var-file="$VAR_FILE")
+fi
+
+echo "==> Using GCP project: $GCP_PROJECT"
 echo "==> 1) Terraform init + validate"
 cd "$TF_DIR"
 terraform init -input=false
@@ -17,12 +32,14 @@ echo
 echo "==> 2) Check GCP credentials"
 if ! gcloud auth application-default print-access-token >/dev/null 2>&1; then
   echo "GCP application-default credentials not found."
-  echo "Run these in your terminal (browser login required):"
+  echo "Run:"
   echo "  gcloud auth login"
   echo "  gcloud auth application-default login"
-  echo "  gcloud config set project $GCP_PROJECT"
   exit 1
 fi
+
+gcloud auth application-default set-quota-project "$GCP_PROJECT" 2>/dev/null || true
+gcloud config set project "$GCP_PROJECT" >/dev/null
 
 echo "GCP credentials: OK"
 
@@ -39,17 +56,17 @@ echo
 echo "==> 5) Import existing secret if needed (local dev reruns)"
 if kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
   if ! terraform state show kubernetes_secret.content_scanner_api_key >/dev/null 2>&1; then
-    terraform import kubernetes_secret.content_scanner_api_key "$NAMESPACE/$SECRET_NAME"
+    terraform import "${TF_ARGS[@]}" kubernetes_secret.content_scanner_api_key "$NAMESPACE/$SECRET_NAME"
   fi
 fi
 
 echo
 echo "==> 6) Terraform plan"
-terraform plan
+terraform plan "${TF_ARGS[@]}"
 
 echo
 echo "==> 7) Terraform apply"
-terraform apply
+terraform apply -auto-approve "${TF_ARGS[@]}"
 
 echo
 echo "==> 8) Verify Kubernetes secret was created from GCP"
@@ -57,7 +74,7 @@ kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.labels
 echo "(secret exists; value intentionally not printed)"
 
 echo
-echo "==> 9) Optional: compare key length with GCP (not the value)"
+echo "==> 9) Compare key length with GCP (not the value)"
 K8S_LEN=$(kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.SCAN_API_KEY}' | base64 -d | wc -c | tr -d ' ')
 GCP_LEN=$(gcloud secrets versions access latest --secret="$GCP_SECRET" --project="$GCP_PROJECT" | wc -c | tr -d ' ')
 echo "GCP secret length:  $GCP_LEN bytes"
@@ -70,4 +87,4 @@ else
 fi
 
 echo
-echo "All Terraform checks passed."
+echo "All Terraform checks passed for project: $GCP_PROJECT"
