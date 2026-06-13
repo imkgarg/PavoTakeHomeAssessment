@@ -11,3 +11,6 @@ terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.*
 terraform/dev.tfvars
+
+# Local submission artifact (attach to email, do not commit)
+Content-Scanner-Submission.pdf
