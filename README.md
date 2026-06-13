@@ -109,6 +109,21 @@ content-scanner pod (SCAN_API_KEY)
 
 Enable Kubernetes in **Docker Desktop → Settings → Kubernetes** for local cluster testing.
 
+## CI
+
+GitHub Actions runs on every push and pull request to `main`:
+
+| Job | What it checks |
+|-----|----------------|
+| **Maven tests** | `mvn test` (Java 21) |
+| **Docker build** | `docker build` succeeds |
+| **Terraform validate** | `terraform fmt -check`, `init`, `validate` |
+| **Kubernetes manifests** | `kubeconform` schema validation for `k8s/` |
+
+CI does **not** run `terraform apply`, deploy to a cluster, or call GCP — those require credentials and are covered in the [testing plan](#testing-plan) for local/dev runs.
+
+Workflow file: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+
 ---
 
 ## Quick start
