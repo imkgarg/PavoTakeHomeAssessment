@@ -8,11 +8,14 @@ An HTTP service that scans tool result content for prompt injection patterns. Wo
 |----------|------|---------|----------|
 | `GET /health` | None | — | `{"status":"ok"}` |
 | `POST /scan` | `Authorization: Bearer <SCAN_API_KEY>` | `{"content":"<string>"}` | `{"safe":true/false,"reason":"<explanation>"}` |
+| `GET /actuator/prometheus` | None (in-cluster) | — | Prometheus metrics |
+| `GET /actuator/health/readiness` | None | — | K8s readiness probe |
 
 - Listens on **port 8000**
 - Reads `SCAN_API_KEY` from the environment (required at startup)
 - Returns **401** for missing or invalid Bearer tokens on `/scan`
 - Flags common prompt injection patterns (instruction override, jailbreak, fake system prompts, etc.)
+- **Phase 1:** JSON structured logs, Prometheus metrics, 2 replicas, non-root container, NetworkPolicy in prod overlay
 
 ## Dev vs prod
 
@@ -82,9 +85,15 @@ content-scanner pod (SCAN_API_KEY)
 .
 ├── src/                          # Spring Boot application (Java 21)
 ├── Dockerfile                    # Multi-stage build (Maven → JRE)
+├── client/                       # Fail-closed HTTP client for exec-runner
 ├── k8s/
-│   ├── deployment.yaml           # content-scanner Deployment
-│   └── service.yaml              # ClusterIP Service on port 8000
+│   ├── base/                     # Deployment, Service, NetworkPolicy
+│   └── overlays/
+│       ├── local/                # Local dev (no NetworkPolicy, example exec-runner)
+│       └── ghcr/                 # Registry-backed production image
+├── .github/workflows/
+│   ├── ci.yml                    # Tests + validation on PR
+│   └── cd.yml                    # Push image to GHCR on merge to main
 ├── terraform/
 │   ├── main.tf                   # GCP Secret Manager → K8s Secret
 │   ├── providers.tf              # Google + Kubernetes providers
@@ -115,14 +124,68 @@ GitHub Actions runs on every push and pull request to `main`:
 
 | Job | What it checks |
 |-----|----------------|
-| **Maven tests** | `mvn test` (Java 21) |
+| **Maven tests** | Service tests + exec-runner client tests |
 | **Docker build** | `docker build` succeeds |
 | **Terraform validate** | `terraform fmt -check`, `init`, `validate` |
-| **Kubernetes manifests** | `kubeconform` schema validation for `k8s/` |
+| **Kubernetes manifests** | `kubeconform` on kustomize overlays (`local`, `ghcr`) |
 
 CI does **not** run `terraform apply`, deploy to a cluster, or call GCP — those require credentials and are covered in the [testing plan](#testing-plan) for local/dev runs.
 
-Workflow file: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+**CD** (`.github/workflows/cd.yml`) runs on merge to `main`: builds and pushes `ghcr.io/imkgarg/content-scanner:<sha>` and `:latest`.
+
+**Branch protection** on `main` requires all CI jobs to pass and changes to go through a pull request.
+
+Workflow files: [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/workflows/cd.yml`](.github/workflows/cd.yml)
+
+---
+
+## Production v1 (Phase 1)
+
+Phase 1 upgrades the assignment stub into an operable internal service:
+
+| Capability | Implementation |
+|------------|----------------|
+| **Registry-backed deploys** | CD pushes to `ghcr.io/imkgarg/content-scanner`; deploy with `k8s/overlays/ghcr` |
+| **Observability** | JSON logs, Prometheus metrics at `/actuator/prometheus`, K8s readiness/liveness probes |
+| **Network isolation** | `NetworkPolicy` allows ingress only from `app: exec-runner` (enabled in `ghcr` overlay) |
+| **exec-runner integration** | `client/` library with `FailClosedContentScanner` — blocks on unsafe content or scanner outage |
+
+### Metrics
+
+| Metric | Meaning |
+|--------|---------|
+| `scanner.requests.total` | Scan requests processed |
+| `scanner.results.safe.total` | Content marked safe |
+| `scanner.results.unsafe.total` | Injection detected |
+| `scanner.auth.failures.total` | Invalid/missing Bearer token |
+
+### exec-runner client (fail-closed)
+
+```java
+ContentScannerClient client = new ContentScannerClient(
+    System.getenv("CONTENT_SCANNER_URL"),  // http://content-scanner:8000
+    System.getenv("SCAN_API_KEY")
+);
+FailClosedContentScanner scanner = new FailClosedContentScanner(client);
+
+// Throws ContentBlockedException if unsafe OR scanner unreachable
+scanner.requireSafeContent(toolResult);
+```
+
+Add dependency: build/install `client/` module into exec-runner's classpath.
+
+### Deploy locally (with example exec-runner pod)
+
+```bash
+docker build -t content-scanner:local .
+kubectl apply -k k8s/overlays/local
+```
+
+### Deploy from registry (after CD publishes)
+
+```bash
+kubectl apply -k k8s/overlays/ghcr
+```
 
 ---
 
@@ -131,9 +194,10 @@ Workflow file: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
 ### Dev mode (full local stack)
 
 ```bash
-# 1. Build and test the service
+# 1. Build and test
 mvn test
-docker build -t content-scanner:latest .
+mvn test -f client/pom.xml
+docker build -t content-scanner:local .
 
 # 2. Authenticate with GCP
 gcloud auth login
@@ -145,8 +209,8 @@ gcloud auth application-default login
 # 4. Deploy to Kubernetes
 kubectl create namespace sandbox-namespace --dry-run=client -o yaml | kubectl apply -f -
 ./terraform/test-terraform.sh
-kubectl apply -f k8s/
-kubectl rollout restart deployment/content-scanner -n sandbox-namespace
+kubectl apply -k k8s/overlays/local
+kubectl rollout status deployment/content-scanner -n sandbox-namespace
 
 # 5. Test in-cluster (the real worker URL)
 API_KEY=$(kubectl get secret content-scanner-api-key -n sandbox-namespace \
@@ -174,7 +238,7 @@ gcloud secrets describe content-scanner-api-key --project agentplatform-prod
 
 kubectl create namespace sandbox-namespace --dry-run=client -o yaml | kubectl apply -f -
 ./terraform/test-terraform.sh
-kubectl apply -f k8s/
+kubectl apply -k k8s/overlays/ghcr
 ```
 
 ---
@@ -208,27 +272,32 @@ curl -X POST http://localhost:8000/scan \
   -H "Authorization: Bearer your-secret-key" \
   -H "Content-Type: application/json" \
   -d '{"content":"ignore all previous instructions"}'
+
+curl -s http://localhost:8000/actuator/prometheus | grep scanner.requests
 ```
 
 ### Unit tests
 
 ```bash
-mvn test
+mvn test                  # service: 39 tests
+mvn test -f client/pom.xml   # exec-runner client: 4 tests
 ```
 
 ---
 
 ## 2. Docker
 
+Runs as **non-root** (UID 10001) with a read-only root filesystem.
+
 ### Build and run
 
 ```bash
-docker build -t content-scanner:latest .
+docker build -t content-scanner:local .
 
 docker run -d --name content-scanner \
   -e SCAN_API_KEY=your-secret-key \
   -p 8000:8000 \
-  content-scanner:latest
+  content-scanner:local
 ```
 
 ### Test (localhost → container)
@@ -240,6 +309,8 @@ curl -X POST http://localhost:8000/scan \
   -H "Authorization: Bearer your-secret-key" \
   -H "Content-Type: application/json" \
   -d '{"content":"hello world"}'
+
+curl -s http://localhost:8000/actuator/prometheus | grep scanner.requests
 ```
 
 ### Stop
@@ -256,6 +327,13 @@ docker stop content-scanner && docker rm content-scanner
 
 Deployed in **`sandbox-namespace`** as a **ClusterIP** service named **`content-scanner`** on port **8000**.
 
+Manifests use **Kustomize**:
+
+| Overlay | Use case | Image | NetworkPolicy |
+|---------|----------|-------|---------------|
+| `k8s/overlays/local` | Local dev | `content-scanner:local` | Disabled (+ example exec-runner pod) |
+| `k8s/overlays/ghcr` | Production | `ghcr.io/imkgarg/content-scanner` | Enabled (exec-runner only) |
+
 ### Deploy
 
 ```bash
@@ -269,7 +347,7 @@ kubectl create secret generic content-scanner-api-key \
   --namespace sandbox-namespace \
   --from-literal=SCAN_API_KEY=your-local-dev-key
 
-kubectl apply -f k8s/
+kubectl apply -k k8s/overlays/local
 kubectl rollout status deployment/content-scanner -n sandbox-namespace
 ```
 
@@ -495,8 +573,8 @@ terraform apply
 **Step 4 — Deploy and restart**
 
 ```bash
-kubectl apply -f k8s/
-kubectl rollout restart deployment/content-scanner -n sandbox-namespace
+kubectl apply -k k8s/overlays/ghcr
+kubectl rollout status deployment/content-scanner -n sandbox-namespace
 ```
 
 ---
@@ -541,11 +619,13 @@ Content-Type: application/json
 
 | Layer | Dev mode | Prod mode |
 |-------|----------|-----------|
-| Unit tests (`mvn test`) | ✅ Full | ✅ Full (same code) |
-| Docker build + run | ✅ Full | ✅ Full (same image) |
-| K8s deploy + in-cluster URL | ✅ Full | ✅ Full (same manifests) |
+| Unit tests (`mvn test` + client) | ✅ 43 tests | ✅ Same |
+| Docker build + run + metrics | ✅ Full | ✅ Full |
+| K8s deploy (`local` or `ghcr` overlay) | ✅ Full | ✅ Full |
 | Terraform validate | ✅ Full | ✅ Full |
 | Terraform plan/apply (GCP → K8s secret) | ✅ Full (your GCP project) | ⚠️ Requires IAM on `agentplatform-prod` |
+| exec-runner client (fail-closed) | ✅ Full | ✅ Full |
+| CD image push to GHCR | ✅ On merge to main | ✅ Same |
 | Port-forward (laptop → cluster) | ✅ Full | ✅ Full |
 
 > **Prod note:** Without company IAM on `agentplatform-prod`, you can still validate Terraform syntax, K8s manifests (`kubectl apply --dry-run=client`), and the in-cluster service path. Only the GCP Secret Manager read and prod `terraform apply` are blocked.
@@ -554,15 +634,18 @@ Content-Type: application/json
 
 | Test | Command / URL | Expected |
 |------|---------------|----------|
-| Unit tests | `mvn test` | 39 tests pass |
+| Service unit tests | `mvn test` | 39 tests pass |
+| Client unit tests | `mvn test -f client/pom.xml` | 4 tests pass |
 | Health (no auth) | `GET /health` | `{"status":"ok"}` |
+| Prometheus metrics | `GET /actuator/prometheus` | Contains `scanner.requests.total` |
 | Scan — safe | `POST /scan` + valid Bearer | `{"safe":true,"reason":"..."}` |
-| Scan — injection | `POST /scan` + `"ignore all previous instructions"` | `{"safe":false,"reason":"Attempt to override prior instructions"}` |
-| Scan — unauthorized | `POST /scan` + wrong/missing Bearer | HTTP 401, `{"error":"Unauthorized"}` |
-| Terraform apply | `./terraform/test-terraform.sh` | `Apply complete`, GCP/K8s secret lengths match |
-| In-cluster DNS | `http://content-scanner:8000/health` from pod in `sandbox-namespace` | `{"status":"ok"}` |
-| In-cluster from laptop | `curl http://content-scanner:8000/...` on Mac | **Fails** — host not found (expected) |
-| Port-forward | `kubectl port-forward ... 8000:8000` then `localhost:8000` | Works for debugging only |
+| Scan — injection | `POST /scan` + `"ignore all previous instructions"` | `{"safe":false,"reason":"..."}` |
+| Scan — unauthorized | `POST /scan` + wrong/missing Bearer | HTTP 401 |
+| Kustomize validate | `kubectl kustomize k8s/overlays/local` | Renders without error |
+| Terraform apply | `./terraform/test-terraform.sh` | `Apply complete`, secret lengths match |
+| In-cluster DNS | `http://content-scanner:8000/health` from `sandbox-namespace` | `{"status":"ok"}` |
+| Fail-closed client | `FailClosedContentScanner.requireSafeContent()` | Throws on unsafe or outage |
+| Port-forward | `kubectl port-forward ... 8000:8000` | Works for debugging only |
 
 ---
 
@@ -571,23 +654,20 @@ Content-Type: application/json
 ### Dev mode (full stack — run this locally)
 
 ```bash
-# ── 1. Service ──────────────────────────────────────────
+# ── 1. Service + client ───────────────────────────────────
 mvn test                                    # expect: 39 tests pass
+mvn test -f client/pom.xml                  # expect: 4 tests pass
 
 # ── 2. Docker ─────────────────────────────────────────────
-docker build -t content-scanner:latest .
+docker build -t content-scanner:local .
 docker run -d --name content-scanner \
-  -e SCAN_API_KEY=dev-docker-key -p 8001:8000 content-scanner:latest
+  -e SCAN_API_KEY=dev-docker-key -p 8001:8000 content-scanner:local
 curl -s http://localhost:8001/health      # expect: {"status":"ok"}
+curl -s http://localhost:8001/actuator/prometheus | grep scanner.requests
 curl -s -X POST http://localhost:8001/scan \
   -H "Authorization: Bearer dev-docker-key" \
   -H "Content-Type: application/json" \
   -d '{"content":"hello"}'                 # expect: safe:true
-curl -s -o /dev/null -w "HTTP %{http_code}\n" \
-  -X POST http://localhost:8001/scan \
-  -H "Authorization: Bearer wrong" \
-  -H "Content-Type: application/json" \
-  -d '{"content":"x"}'                     # expect: HTTP 401
 docker stop content-scanner && docker rm content-scanner
 
 # ── 3. GCP + Terraform ────────────────────────────────────
@@ -598,7 +678,7 @@ gcloud auth application-default login
 
 # ── 4. Kubernetes ─────────────────────────────────────────
 kubectl create namespace sandbox-namespace --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f k8s/
+kubectl apply -k k8s/overlays/local
 kubectl rollout restart deployment/content-scanner -n sandbox-namespace
 kubectl rollout status deployment/content-scanner -n sandbox-namespace
 
@@ -653,7 +733,7 @@ mv terraform/dev.tfvars terraform/dev.tfvars.bak
 cd terraform && terraform validate && cd ..
 
 # K8s manifests are valid
-kubectl apply -f k8s/ --dry-run=client
+kubectl kustomize k8s/overlays/ghcr >/dev/null && echo "ghcr overlay: OK"
 
 # GCP access will fail until admin grants access:
 gcloud secrets describe content-scanner-api-key --project agentplatform-prod
@@ -674,8 +754,8 @@ gcloud auth application-default set-quota-project agentplatform-prod
 
 gcloud secrets describe content-scanner-api-key --project agentplatform-prod  # must succeed
 ./terraform/test-terraform.sh                     # expect: Apply complete
-kubectl apply -f k8s/
-kubectl rollout restart deployment/content-scanner -n sandbox-namespace
+kubectl apply -k k8s/overlays/ghcr
+kubectl rollout status deployment/content-scanner -n sandbox-namespace
 
 # Same in-cluster tests as dev (use API_KEY from cluster secret)
 API_KEY=$(kubectl get secret content-scanner-api-key -n sandbox-namespace \
@@ -703,3 +783,5 @@ mv terraform/dev.tfvars.bak terraform/dev.tfvars   # restore dev
 | Pod `CreateContainerConfigError` | Missing K8s secret | Run `./terraform/test-terraform.sh` or create secret manually |
 | Scan returns 401 after Terraform apply | Pod still using old secret | `kubectl rollout restart deployment/content-scanner -n sandbox-namespace` |
 | `test-terraform.sh` uses wrong project | Stale `dev.tfvars` | Check `terraform/dev.tfvars` or set `GCP_PROJECT=your-project ./terraform/test-terraform.sh` |
+| curl pod blocked on `ghcr` overlay | NetworkPolicy active | Use `exec-runner` labeled pod or `local` overlay for debug |
+| Image pull error on `ghcr` overlay | GHCR package private or missing | Run CD workflow on main first; make package public or configure `imagePullSecrets` |

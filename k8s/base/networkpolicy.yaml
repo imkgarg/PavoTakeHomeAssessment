@@ -1,0 +1,18 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: content-scanner
+spec:
+  podSelector:
+    matchLabels:
+      app: content-scanner
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: exec-runner
+      ports:
+        - protocol: TCP
+          port: 8000

@@ -23,8 +23,11 @@ jobs:
           distribution: temurin
           cache: maven
 
-      - name: Run unit tests
+      - name: Run service unit tests
         run: mvn -B test
+
+      - name: Run exec-runner client tests
+        run: mvn -B test -f client/pom.xml
 
   docker:
     name: Docker build
@@ -76,5 +79,10 @@ jobs:
             | tar xz kubeconform
           sudo mv kubeconform /usr/local/bin/kubeconform
 
-      - name: Validate manifests
-        run: kubeconform -summary -kubernetes-version 1.29.0 k8s/
+      - name: Validate local overlay
+        run: |
+          kubectl kustomize k8s/overlays/local | kubeconform -summary -kubernetes-version 1.29.0 -
+
+      - name: Validate GHCR overlay
+        run: |
+          kubectl kustomize k8s/overlays/ghcr | kubeconform -summary -kubernetes-version 1.29.0 -
