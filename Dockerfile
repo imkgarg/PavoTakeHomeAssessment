@@ -12,7 +12,13 @@ RUN mvn -B package -DskipTests
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 
+RUN groupadd --system --gid 10001 appgroup \
+    && useradd --system --uid 10001 --gid appgroup appuser
+
 COPY --from=build /app/target/content-scanner-*.jar app.jar
+RUN chown -R appuser:appgroup /app
+
+USER 10001:10001
 
 EXPOSE 8000
 

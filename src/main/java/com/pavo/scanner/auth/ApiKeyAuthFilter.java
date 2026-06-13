@@ -1,5 +1,6 @@
 package com.pavo.scanner.auth;
 
+import com.pavo.scanner.observability.ScanMetrics;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -20,17 +21,22 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
     private static final String BEARER_PREFIX = "Bearer ";
 
     private final byte[] expectedApiKey;
+    private final ScanMetrics scanMetrics;
 
-    public ApiKeyAuthFilter(@Value("${SCAN_API_KEY:}") String scanApiKey) {
+    public ApiKeyAuthFilter(@Value("${SCAN_API_KEY:}") String scanApiKey, ScanMetrics scanMetrics) {
         if (scanApiKey == null || scanApiKey.isBlank()) {
             throw new IllegalStateException("SCAN_API_KEY environment variable must be set");
         }
         this.expectedApiKey = scanApiKey.getBytes(StandardCharsets.UTF_8);
+        this.scanMetrics = scanMetrics;
     }
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        return "/health".equals(request.getRequestURI());
+        String path = request.getRequestURI();
+        return "/health".equals(path)
+                || path.startsWith("/actuator/health")
+                || "/actuator/prometheus".equals(path);
     }
 
     @Override
@@ -55,6 +61,7 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
     }
 
     private void reject(HttpServletResponse response) throws IOException {
+        scanMetrics.recordAuthFailure();
         response.setStatus(HttpStatus.UNAUTHORIZED.value());
         response.setContentType("application/json");
         response.getWriter().write("{\"error\":\"Unauthorized\"}");

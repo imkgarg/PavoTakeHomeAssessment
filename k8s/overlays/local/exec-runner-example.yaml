@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: exec-runner
+  labels:
+    app: exec-runner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: exec-runner
+  template:
+    metadata:
+      labels:
+        app: exec-runner
+    spec:
+      containers:
+        - name: exec-runner
+          image: curlimages/curl:latest
+          command: ["sleep", "infinity"]
+          env:
+            - name: CONTENT_SCANNER_URL
+              value: http://content-scanner:8000
+            - name: SCAN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: content-scanner-api-key
+                  key: SCAN_API_KEY
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
